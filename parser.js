@@ -1,5 +1,13 @@
-const fs = require("fs");
-const prettier = require("prettier");
+import fs from "fs";
+import {
+  CSS_COLOR_VARIABLE_DIGITS_SUFFIX,
+  FONT_WEIGHTS,
+  FONT_WEIGHT_SET,
+  PASTE_AS_VAR,
+  TYPE,
+} from "./constants.js";
+import { Transform } from "./transform.js";
+import { CSSStructure } from "./structures.js";
 
 const theme = JSON.parse(fs.readFileSync("./theme.json", "utf-8")).global;
 
@@ -28,128 +36,6 @@ const theme = JSON.parse(fs.readFileSync("./theme.json", "utf-8")).global;
  * @typedef {'typography' | 'boxShadow'} Type
  * @returns
  */
-
-const FONT_WEIGHTS = {
-  Thin: 100,
-  "Extra Light": 200,
-  Light: 300,
-  Normal: 400,
-  Regular: 400,
-  Medium: 500,
-  "Semi Bold": 600,
-  Bold: 700,
-  "Extra Bold": 800,
-};
-
-const FONT_WEIGHT_SET = new Set(Object.keys(FONT_WEIGHTS));
-
-const PROPERTIES_IN_PX = new Set(["font-size", "line-height"]);
-
-const TYPE = {
-  TYPOGRAPHY: "typography",
-  BOX_SHADOW: "boxShadow",
-};
-
-const getType = (str) => (str.includes("#") ? "color" : "measure");
-
-class Transform {
-  /**
-   *
-   * @param {string} text
-   * @returns {string}
-   */
-
-  static toCebabCase = (text) =>
-    text.replaceAll(/[A-Z]/, (letter) => `-${letter.toLowerCase()}`);
-
-  static fromPathToCebabCase = (text) =>
-    this.toCebabCase(text.replaceAll(/\./g, "-"));
-
-  static toSnakeCase =
-    /**
-     * @param {string} path
-     */
-    (path) => path.replace(/-\w/, (part) => part[1].toUpperCase());
-  static toCssVar = (path, value) =>
-    `--${this.fromPathToCebabCase(path)}: ${value};`;
-
-  static toCssProperty = (name, value) => {
-    const propertyName = Transform.toCebabCase(name);
-    if (PROPERTIES_IN_PX.has(propertyName)) value += "px";
-    return `${propertyName}: ${value};`;
-  };
-
-  static pasteWithSpacesAsPx = (arr) =>
-    arr.map((v) => (getType(v) === "color" ? v : `${v}px`)).join(" ");
-
-  static toPx = (text) => `${text}px`;
-
-  /**
-   *
-   * @param {string} text
-   * @returns
-   */
-  static addSuffix = (text) => (/^[\d\.]+$/.test(text) ? `${text}px` : text);
-
-  static toCssClass = (name, value) =>
-    `.${name} {\n${" ".repeat(4)}${value}\n}`;
-
-  static getPath = (path, suffix) =>
-    path.length ? `${path}.${suffix}` : suffix;
-
-  static applyToEveryProperty = (obj, f) =>
-    Object.entries(obj).reduce(
-      (prev, [key, value]) => ({ ...prev, [key]: f(value) }),
-      {}
-    );
-
-  /**
-   *
-   * @template T
-   * @param {T  } obj
-   * @param {Array<keyof T>} exclude
-   * @returns
-   */
-  static excludeSome = (obj, exclude) =>
-    Object.fromEntries(
-      Object.entries(obj).filter(([key]) => !exclude.includes(key))
-    );
-}
-
-class CSSStructure {
-  #variables;
-  #classes;
-
-  constructor() {
-    this.#variables = [];
-    this.#classes = [];
-  }
-
-  addVarable = (path, text) =>
-    this.#variables.push(Transform.toCssVar(path, text));
-
-  addClass = (path, text) =>
-    this.#classes.push(
-      Transform.toCssClass(Transform.fromPathToCebabCase(path), text)
-    );
-
-  getResult = () => {
-    const r = prettier.format(
-      `:root{\n    ${this.#variables.join("\n")}\n}\n\n${this.#classes.join(
-        "\n\n"
-      )}`,
-      {
-        parser: "css",
-        tabWidth: 4,
-      }
-    );
-    return r;
-  };
-
-  get length() {
-    return this.#variables.length + this.#classes.length;
-  }
-}
 
 class Parser {
   #data;
@@ -209,7 +95,18 @@ class Parser {
         this.#result.addClass(path, text);
         return;
       }
-      this.#result.addVarable(path, Transform.addSuffix(text));
+
+      if (type === TYPE.COLOR && !this.#hasRef(text)) {
+        this.#result.addVarable(
+          path +
+            Transform.fromCebabCaseToPascalCase(
+              CSS_COLOR_VARIABLE_DIGITS_SUFFIX
+            ),
+          Transform.hexWithoutAlphaToRgbaWithoutFunction(text)
+        );
+      }
+
+      this.#result.addVarable(path, Transform.addPxSuffix(text));
       return;
     }
   };
@@ -221,15 +118,20 @@ class Parser {
   #getValue = (keys) => keys.split(".").reduce((obj, key) => obj[key], theme);
 
   #getParsedValue = (key) => {
-    console.log(key);
     const value = this.#getValue(key);
 
     return this.#parse(value);
   };
 
+  #hasRef = (css) => css.includes("var");
+
   #parse = (readed) => {
     if (readed?.type === TYPE.TYPOGRAPHY) {
       return this.#parseTypography(readed.value);
+    }
+
+    if (readed?.type === TYPE.COLOR) {
+      return this.#parseColor(readed.value);
     }
 
     if (readed?.type === TYPE.BOX_SHADOW) {
@@ -251,11 +153,39 @@ class Parser {
           v.y,
           v.blur,
           v.spread,
-          this.#parseSimple(v.color),
+          this.#parseColor(v.color),
         ])
       )
       .join(", ");
   };
+
+  /**
+   * 
+   * @param {boolean} withAlpha 
+   * @returns 
+   */
+  #getReplaceColor = (withAlpha) => (v) => {
+    const getPath = () => (withAlpha ? v.slice(1, -3) : v.slice(1, -1));
+    const getAlpha = () => (withAlpha ? v.slice(-2) : "ff");
+
+    const newPath = getPath();
+
+    return PASTE_AS_VAR.some((pattern) => RegExp(pattern).test(newPath))
+      ? Transform.hexWithRefToRgba(
+          Transform.toReferenceToCssVar(newPath),
+          getAlpha()
+        )
+      : Transform.hexToRgba(this.#getParsedValue(newPath) + getAlpha());
+  };
+
+  /**
+   *
+   * @param {string} value
+   */
+  #parseColor = (value) =>
+    value
+      .replaceAll(/{.+?}[A-Fa-f0-9]{2}/g, this.#getReplaceColor(true))
+      .replaceAll(/{.+?}/g, this.#getReplaceColor(false));
 
   /**
    *
