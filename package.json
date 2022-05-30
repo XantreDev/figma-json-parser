@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "start": "node parser.js"
+  },
+  "dependencies": {
+    "prettier": "^2.6.2"
+  }
+}
